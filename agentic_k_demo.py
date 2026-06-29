@@ -1,0 +1,296 @@
+import json
+import math
+import os
+from typing import Literal
+
+import matplotlib.pyplot as plt
+import numpy as np
+from pydantic import BaseModel, Field, ValidationError
+
+from heateq_num_solver import gaussian_ic, heat_errors, solve_heat
+
+
+K_MIN = 1e-4
+K_MAX = 1.0
+MAX_ITERATIONS = 20
+TARGET_U_ERROR = 1e-3
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL = "google/gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
+
+
+class AgentDecision(BaseModel):
+    action: Literal["evaluate", "stop"]
+    k_guess: float | None = None
+    rationale: str = ""
+    confidence: float = Field(ge=0.0, le=1.0)
+    stop_reason: str | None = None
+
+
+def response_format_schema():
+    return {
+        "type": "text",
+        "mime_type": "application/json",
+        "schema": AgentDecision.model_json_schema(),
+    }
+
+
+def openai_response_format_schema():
+    return {"type": "json_object"}
+
+
+def extract_text(response):
+    if hasattr(response, "text") and response.text:
+        return response.text
+    if hasattr(response, "choices") and response.choices:
+        message = response.choices[0].message
+        if hasattr(message, "content") and message.content:
+            return message.content
+    if isinstance(response, str):
+        return response
+    return str(response)
+
+
+def parse_decision(raw_text):
+    try:
+        payload = json.loads(raw_text)
+        return AgentDecision.model_validate(payload), None
+    except (json.JSONDecodeError, ValidationError) as exc:
+        return None, str(exc)
+
+
+def valid_k_guess(decision):
+    if decision.action != "evaluate":
+        return False
+    if decision.k_guess is None:
+        return False
+    return math.isfinite(decision.k_guess) and K_MIN <= decision.k_guess <= K_MAX
+
+
+def build_prompt(history, best_so_far):
+    compact_history = [
+        {
+            "iteration": item["iteration"],
+            "k_guess": item["k_guess"],
+            "u_error": item["u_error"],
+            "width_error": item["width_error"],
+        }
+        for item in history[-8:]
+    ]
+    return (
+        "You are estimating the heat diffusivity k for a 1D heat equation. "
+        "Return only a JSON object with these fields: "
+        "action ('evaluate' or 'stop'), k_guess (number or null), rationale "
+        "(string), confidence (number from 0 to 1), and stop_reason "
+        "(string or null).\n\n"
+        f"Valid k bounds: [{K_MIN}, {K_MAX}]\n"
+        f"Stopping target: u_error <= {TARGET_U_ERROR}\n"
+        "Rule: positive width_error means k is too high; negative width_error "
+        "means k is too low.\n"
+        f"Best result so far: {best_so_far}\n"
+        f"Recent history: {compact_history}\n\n"
+        "Choose action='evaluate' with a finite in-bounds k_guess unless the "
+        "best result is already good enough, in which case choose action='stop'."
+    )
+
+
+class AgentClient:
+    def __init__(self, provider, client, model):
+        self.provider = provider
+        self.client = client
+        self.model = model
+
+
+def create_agent_client():
+    if os.environ.get("OPENROUTER_API_KEY"):
+        from openai import OpenAI
+
+        return AgentClient(
+            provider="openrouter",
+            client=OpenAI(
+                base_url=OPENROUTER_BASE_URL,
+                api_key=os.environ["OPENROUTER_API_KEY"],
+                default_headers={
+                    "HTTP-Referer": "http://localhost",
+                    "X-Title": "Agentic Physics Heat Diffusivity Demo",
+                },
+            ),
+            model=os.environ.get("OPENROUTER_MODEL", OPENROUTER_MODEL),
+        )
+
+    if os.environ.get("GEMINI_API_KEY"):
+        from google import genai
+
+        return AgentClient(
+            provider="gemini",
+            client=genai.Client(),
+            model=os.environ.get("GEMINI_MODEL", GEMINI_MODEL),
+        )
+
+    raise RuntimeError(
+        "Set OPENROUTER_API_KEY for OpenRouter or GEMINI_API_KEY for Google Gemini."
+    )
+
+
+def env_status():
+    openrouter_set = bool(os.environ.get("OPENROUTER_API_KEY"))
+    gemini_set = bool(os.environ.get("GEMINI_API_KEY"))
+    return {
+        "OPENROUTER_API_KEY": "set" if openrouter_set else "unset",
+        "GEMINI_API_KEY": "set" if gemini_set else "unset",
+    }
+
+
+def call_agent(agent_client, prompt):
+    if agent_client.provider == "openrouter":
+        return agent_client.client.chat.completions.create(
+            model=agent_client.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Return only a valid JSON object. Do not include markdown, "
+                        "code fences, or explanatory text outside the JSON."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=512,
+            response_format=openai_response_format_schema(),
+        )
+
+    return agent_client.client.interactions.create(
+        model=agent_client.model,
+        input=prompt,
+        response_format=response_format_schema(),
+    )
+
+
+def evaluate_guess(k_guess, u0, target_u, config):
+    u_error, width_error = heat_errors(
+        k_guess,
+        u0,
+        config["T"],
+        config["Nx"],
+        config["dt"],
+        target_u,
+        L=config["L"],
+    )
+    return float(u_error), float(width_error)
+
+
+def run_agent_loop(agent_client):
+    config = {"k_true": 0.12, "L": 1.0, "Nx": 101, "T": 0.02, "dt": 1e-4}
+    x = np.linspace(0.0, config["L"], config["Nx"])
+    u0 = gaussian_ic(x)
+    _, target_u = solve_heat(
+        config["k_true"],
+        u0,
+        config["T"],
+        config["Nx"],
+        config["dt"],
+        l=config["L"],
+    )
+
+    history = []
+    best_so_far = None
+
+    print(f"provider: {agent_client.provider}")
+    print(f"model:    {agent_client.model}")
+    print()
+    print("iter  k_guess       u_error      width_error   confidence  rationale")
+    print("----  ------------  -----------  ------------  ----------  ---------")
+
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        prompt = build_prompt(history, best_so_far)
+        response = call_agent(agent_client, prompt)
+        decision, parse_error = parse_decision(extract_text(response))
+        if decision is None:
+            print(f"{iteration:>4}  invalid response: {parse_error}")
+            continue
+
+        if decision.action == "stop":
+            print(f"{iteration:>4}  stop: {decision.stop_reason or decision.rationale}")
+            break
+
+        if not valid_k_guess(decision):
+            print(f"{iteration:>4}  invalid k_guess: {decision.k_guess!r}")
+            continue
+
+        u_error, width_error = evaluate_guess(decision.k_guess, u0, target_u, config)
+        observation = {
+            "iteration": iteration,
+            "k_guess": decision.k_guess,
+            "u_error": u_error,
+            "width_error": width_error,
+            "confidence": decision.confidence,
+            "rationale": decision.rationale,
+        }
+        history.append(observation)
+        if best_so_far is None or u_error < best_so_far["u_error"]:
+            best_so_far = observation
+
+        print(
+            f"{iteration:>4}  {decision.k_guess:>12.8f}  {u_error:>11.4e}  "
+            f"{width_error:>12.4e}  {decision.confidence:>10.2f}  {decision.rationale}"
+        )
+
+        if u_error <= TARGET_U_ERROR:
+            break
+
+    if best_so_far is None:
+        raise RuntimeError("No valid in-bounds agent guesses were evaluated.")
+
+    _, best_u = solve_heat(
+        best_so_far["k_guess"],
+        u0,
+        config["T"],
+        config["Nx"],
+        config["dt"],
+        l=config["L"],
+    )
+
+    print("\nFinal report")
+    print(f"estimated k: {best_so_far['k_guess']:.8f}")
+    print(f"true k:      {config['k_true']:.8f}")
+    print(f"abs error:   {abs(best_so_far['k_guess'] - config['k_true']):.4e}")
+    print(f"best loss:   {best_so_far['u_error']:.4e}")
+    print(f"iterations:  {len(history)} valid evaluations")
+
+    plot_results(x, target_u, best_u, history)
+    return best_so_far
+
+
+def plot_results(x, target_u, best_u, history):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+    axes[0].plot(x, target_u, label="target")
+    axes[0].plot(x, best_u, "--", label="best estimate")
+    axes[0].set_xlabel("x")
+    axes[0].set_ylabel("u")
+    axes[0].legend()
+
+    iterations = [item["iteration"] for item in history]
+    errors = [item["u_error"] for item in history]
+    axes[1].semilogy(iterations, errors, marker="o")
+    axes[1].set_xlabel("iteration")
+    axes[1].set_ylabel("relative field error")
+    axes[1].grid(True, which="both", alpha=0.3)
+
+    fig.tight_layout()
+    plt.show()
+
+
+def main():
+    status = env_status()
+    print(
+        "environment: "
+        f"OPENROUTER_API_KEY={status['OPENROUTER_API_KEY']}, "
+        f"GEMINI_API_KEY={status['GEMINI_API_KEY']}"
+    )
+    agent_client = create_agent_client()
+    run_agent_loop(agent_client)
+
+
+if __name__ == "__main__":
+    main()
