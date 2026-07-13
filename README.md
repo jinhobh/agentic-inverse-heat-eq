@@ -44,8 +44,12 @@ export GEMINI_MODEL="gemini-3.5-flash"
 .venv/bin/python agentic_k_demo.py
 ```
 
-The script prints an iteration table and final estimate, then opens a Matplotlib
-plot comparing the target profile with the best estimated profile.
+The script prints a per-iteration table (`k` guess, `k` absolute error, field
+error, signed width error, confidence) and a final estimate. It writes the full
+history to `k_history.csv`, saves a 4-panel figure to `k_convergence.png`, and
+opens a Matplotlib window. The figure shows the target vs. best profile, `k`
+guesses per iteration against `k_true`, field/`k` errors per iteration on a log
+scale, and the signed width error per iteration.
 
 ## Test
 

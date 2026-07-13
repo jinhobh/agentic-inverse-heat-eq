@@ -12,3 +12,5 @@ output.md
 output.txt
 .env
 *.log
+k_history.csv
+k_convergence.png
