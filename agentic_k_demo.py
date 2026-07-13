@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 import os
@@ -14,6 +15,8 @@ K_MIN = 1e-4
 K_MAX = 1.0
 MAX_ITERATIONS = 20
 TARGET_U_ERROR = 1e-3
+HISTORY_CSV_PATH = "k_history.csv"
+PLOT_PATH = "k_convergence.png"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = "google/gemini-2.5-flash"
 GEMINI_MODEL = "gemini-3.5-flash"
@@ -250,34 +253,116 @@ def run_agent_loop(agent_client):
         l=config["L"],
     )
 
+    k_true = config["k_true"]
+
+    print_history_table(history, k_true)
+    csv_path = write_history_csv(history, k_true, HISTORY_CSV_PATH)
+
     print("\nFinal report")
     print(f"estimated k: {best_so_far['k_guess']:.8f}")
-    print(f"true k:      {config['k_true']:.8f}")
-    print(f"abs error:   {abs(best_so_far['k_guess'] - config['k_true']):.4e}")
+    print(f"true k:      {k_true:.8f}")
+    print(f"abs error:   {abs(best_so_far['k_guess'] - k_true):.4e}")
     print(f"best loss:   {best_so_far['u_error']:.4e}")
     print(f"iterations:  {len(history)} valid evaluations")
+    print(f"history csv: {csv_path}")
 
-    plot_results(x, target_u, best_u, history)
+    plot_results(x, target_u, best_u, history, k_true, PLOT_PATH)
     return best_so_far
 
 
-def plot_results(x, target_u, best_u, history):
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+def print_history_table(history, k_true):
+    """Print a per-iteration table of k guesses and errors."""
+    print("\nPer-iteration guesses")
+    header = (
+        f"{'iter':>4}  {'k_guess':>12}  {'k_abs_error':>12}  "
+        f"{'u_error':>11}  {'width_error':>12}  {'confidence':>10}"
+    )
+    print(header)
+    print("-" * len(header))
+    for item in history:
+        print(
+            f"{item['iteration']:>4}  {item['k_guess']:>12.8f}  "
+            f"{abs(item['k_guess'] - k_true):>12.4e}  {item['u_error']:>11.4e}  "
+            f"{item['width_error']:>12.4e}  {item['confidence']:>10.2f}"
+        )
 
-    axes[0].plot(x, target_u, label="target")
-    axes[0].plot(x, best_u, "--", label="best estimate")
-    axes[0].set_xlabel("x")
-    axes[0].set_ylabel("u")
-    axes[0].legend()
 
+def write_history_csv(history, k_true, path):
+    """Write the per-iteration history to a CSV file and return its path."""
+    fields = [
+        "iteration",
+        "k_guess",
+        "k_abs_error",
+        "u_error",
+        "width_error",
+        "confidence",
+        "rationale",
+    ]
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for item in history:
+            writer.writerow(
+                {
+                    "iteration": item["iteration"],
+                    "k_guess": item["k_guess"],
+                    "k_abs_error": abs(item["k_guess"] - k_true),
+                    "u_error": item["u_error"],
+                    "width_error": item["width_error"],
+                    "confidence": item["confidence"],
+                    "rationale": item["rationale"],
+                }
+            )
+    return path
+
+
+def plot_results(x, target_u, best_u, history, k_true, save_path=None):
     iterations = [item["iteration"] for item in history]
-    errors = [item["u_error"] for item in history]
-    axes[1].semilogy(iterations, errors, marker="o")
-    axes[1].set_xlabel("iteration")
-    axes[1].set_ylabel("relative field error")
-    axes[1].grid(True, which="both", alpha=0.3)
+    k_guesses = [item["k_guess"] for item in history]
+    u_errors = [item["u_error"] for item in history]
+    k_errors = [abs(item["k_guess"] - k_true) for item in history]
+    width_errors = [item["width_error"] for item in history]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # Target vs best estimated profile.
+    axes[0, 0].plot(x, target_u, label="target")
+    axes[0, 0].plot(x, best_u, "--", label="best estimate")
+    axes[0, 0].set_xlabel("x")
+    axes[0, 0].set_ylabel("u")
+    axes[0, 0].set_title("Field profile")
+    axes[0, 0].legend()
+
+    # k guess per iteration with true-k reference line.
+    axes[0, 1].plot(iterations, k_guesses, marker="o", label="k_guess")
+    axes[0, 1].axhline(k_true, color="k", linestyle=":", label="k_true")
+    axes[0, 1].set_xlabel("iteration")
+    axes[0, 1].set_ylabel("k")
+    axes[0, 1].set_title("k guess per iteration")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Field and k errors per iteration (log scale).
+    axes[1, 0].semilogy(iterations, u_errors, marker="o", label="relative field error")
+    axes[1, 0].semilogy(iterations, k_errors, marker="s", label="k abs error")
+    axes[1, 0].set_xlabel("iteration")
+    axes[1, 0].set_ylabel("error")
+    axes[1, 0].set_title("Error per iteration")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, which="both", alpha=0.3)
+
+    # Signed width error per iteration.
+    axes[1, 1].plot(iterations, width_errors, marker="o", color="C3")
+    axes[1, 1].axhline(0.0, color="k", linestyle=":")
+    axes[1, 1].set_xlabel("iteration")
+    axes[1, 1].set_ylabel("width_error (guess - target)")
+    axes[1, 1].set_title("Signed width error per iteration")
+    axes[1, 1].grid(True, alpha=0.3)
 
     fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        print(f"plot saved: {save_path}")
     plt.show()
 
 
