@@ -14,3 +14,6 @@ output.txt
 *.log
 k_history.csv
 k_convergence.png
+k_sweep_results.csv
+k_sweep_performance.png
+k_sweep_trajectories.png

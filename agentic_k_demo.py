@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 import math
@@ -17,9 +18,37 @@ MAX_ITERATIONS = 20
 TARGET_U_ERROR = 1e-3
 HISTORY_CSV_PATH = "k_history.csv"
 PLOT_PATH = "k_convergence.png"
+SWEEP_CSV_PATH = "k_sweep_results.csv"
+SWEEP_PLOT_PATH = "k_sweep_performance.png"
+SWEEP_TRAJECTORY_PATH = "k_sweep_trajectories.png"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = "google/gemini-2.5-flash"
 GEMINI_MODEL = "gemini-3.5-flash"
+
+# Default k_true values to sweep, from very small to very big, log-spaced. Small
+# and large k are physically hard to identify because the field is insensitive to
+# k there (little diffusion, or fully diffused). The first and last two values
+# (1e-5, 2.0, 5.0) sit OUTSIDE the [K_MIN, K_MAX] range the agent may guess in, so
+# the agent cannot reach the true k and can only rail against the nearest bound.
+SWEEP_K_VALUES = [
+    1e-5,
+    1e-4,
+    2e-4,
+    5e-4,
+    1e-3,
+    5e-3,
+    1e-2,
+    5e-2,
+    0.12,
+    0.3,
+    0.5,
+    0.8,
+    1.0,
+    2.0,
+    5.0,
+]
+
+BASE_CONFIG = {"L": 1.0, "Nx": 101, "T": 0.02, "dt": 1e-4}
 
 
 class AgentDecision(BaseModel):
@@ -104,7 +133,10 @@ class AgentClient:
         self.model = model
 
 
-def create_agent_client():
+def create_agent_client(mock=False):
+    if mock:
+        return AgentClient(provider="mock", client=None, model="log-bisection")
+
     if os.environ.get("OPENROUTER_API_KEY"):
         from openai import OpenAI
 
@@ -131,7 +163,8 @@ def create_agent_client():
         )
 
     raise RuntimeError(
-        "Set OPENROUTER_API_KEY for OpenRouter or GEMINI_API_KEY for Google Gemini."
+        "Set OPENROUTER_API_KEY for OpenRouter or GEMINI_API_KEY for Google "
+        "Gemini, or pass --mock for the offline solver-in-the-loop agent."
     )
 
 
@@ -169,6 +202,54 @@ def call_agent(agent_client, prompt):
     )
 
 
+class MockProposer:
+    """Deterministic offline agent: log-domain bisection on width-error sign.
+
+    Stands in for the LLM so the loop and sweep can run without API access. It
+    also cleanly exposes the *physics* limit: at extreme k the field barely
+    responds to k, so even a perfect bracketing search leaves a large k error
+    once u_error dips below the stopping target.
+    """
+
+    def __init__(self):
+        self.lo = K_MIN
+        self.hi = K_MAX
+
+    def propose(self, history, best_so_far):
+        if history:
+            last = history[-1]
+            k = last["k_guess"]
+            width_error = last["width_error"]
+            if width_error > 0:  # guess diffused too much -> k too high
+                self.hi = min(self.hi, k)
+            elif width_error < 0:  # k too low
+                self.lo = max(self.lo, k)
+        guess = math.sqrt(self.lo * self.hi)
+        decision = AgentDecision(
+            action="evaluate",
+            k_guess=guess,
+            rationale="mock log-bisection on width_error sign",
+            confidence=0.5,
+        )
+        return decision, None
+
+
+class LLMProposer:
+    def __init__(self, agent_client):
+        self.agent_client = agent_client
+
+    def propose(self, history, best_so_far):
+        prompt = build_prompt(history, best_so_far)
+        response = call_agent(self.agent_client, prompt)
+        return parse_decision(extract_text(response))
+
+
+def make_proposer(agent_client):
+    if agent_client.provider == "mock":
+        return MockProposer()
+    return LLMProposer(agent_client)
+
+
 def evaluate_guess(k_guess, u0, target_u, config):
     u_error, width_error = heat_errors(
         k_guess,
@@ -182,45 +263,64 @@ def evaluate_guess(k_guess, u0, target_u, config):
     return float(u_error), float(width_error)
 
 
-def run_agent_loop(agent_client):
-    config = {"k_true": 0.12, "L": 1.0, "Nx": 101, "T": 0.02, "dt": 1e-4}
-    x = np.linspace(0.0, config["L"], config["Nx"])
+def run_single(
+    agent_client,
+    k_true,
+    config=None,
+    max_iterations=MAX_ITERATIONS,
+    verbose=True,
+):
+    """Run the agent loop against one true diffusivity and return a result dict."""
+    cfg = dict(BASE_CONFIG)
+    if config:
+        cfg.update(config)
+    cfg["k_true"] = k_true
+
+    x = np.linspace(0.0, cfg["L"], cfg["Nx"])
     u0 = gaussian_ic(x)
     _, target_u = solve_heat(
-        config["k_true"],
-        u0,
-        config["T"],
-        config["Nx"],
-        config["dt"],
-        l=config["L"],
+        k_true, u0, cfg["T"], cfg["Nx"], cfg["dt"], l=cfg["L"]
     )
 
+    proposer = make_proposer(agent_client)
     history = []
     best_so_far = None
+    iters_to_converge = None
 
-    print(f"provider: {agent_client.provider}")
-    print(f"model:    {agent_client.model}")
-    print()
-    print("iter  k_guess       u_error      width_error   confidence  rationale")
-    print("----  ------------  -----------  ------------  ----------  ---------")
+    if verbose:
+        print(f"provider: {agent_client.provider}")
+        print(f"model:    {agent_client.model}")
+        print(f"k_true:   {k_true:.6g}\n")
+        print("iter  k_guess       u_error      width_error   confidence  rationale")
+        print("----  ------------  -----------  ------------  ----------  ---------")
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
-        prompt = build_prompt(history, best_so_far)
-        response = call_agent(agent_client, prompt)
-        decision, parse_error = parse_decision(extract_text(response))
+    for iteration in range(1, max_iterations + 1):
+        try:
+            decision, parse_error = proposer.propose(history, best_so_far)
+        except Exception as exc:
+            # A transient API error should not discard the guesses already made;
+            # if none were made yet, let the caller decide how to record it.
+            if best_so_far is not None:
+                if verbose:
+                    print(f"{iteration:>4}  api error, stopping run: {exc}")
+                break
+            raise
         if decision is None:
-            print(f"{iteration:>4}  invalid response: {parse_error}")
+            if verbose:
+                print(f"{iteration:>4}  invalid response: {parse_error}")
             continue
 
         if decision.action == "stop":
-            print(f"{iteration:>4}  stop: {decision.stop_reason or decision.rationale}")
+            if verbose:
+                print(f"{iteration:>4}  stop: {decision.stop_reason or decision.rationale}")
             break
 
         if not valid_k_guess(decision):
-            print(f"{iteration:>4}  invalid k_guess: {decision.k_guess!r}")
+            if verbose:
+                print(f"{iteration:>4}  invalid k_guess: {decision.k_guess!r}")
             continue
 
-        u_error, width_error = evaluate_guess(decision.k_guess, u0, target_u, config)
+        u_error, width_error = evaluate_guess(decision.k_guess, u0, target_u, cfg)
         observation = {
             "iteration": iteration,
             "k_guess": decision.k_guess,
@@ -233,41 +333,116 @@ def run_agent_loop(agent_client):
         if best_so_far is None or u_error < best_so_far["u_error"]:
             best_so_far = observation
 
-        print(
-            f"{iteration:>4}  {decision.k_guess:>12.8f}  {u_error:>11.4e}  "
-            f"{width_error:>12.4e}  {decision.confidence:>10.2f}  {decision.rationale}"
-        )
+        if verbose:
+            print(
+                f"{iteration:>4}  {decision.k_guess:>12.8f}  {u_error:>11.4e}  "
+                f"{width_error:>12.4e}  {decision.confidence:>10.2f}  {decision.rationale}"
+            )
 
         if u_error <= TARGET_U_ERROR:
+            if iters_to_converge is None:
+                iters_to_converge = len(history)
             break
 
     if best_so_far is None:
-        raise RuntimeError("No valid in-bounds agent guesses were evaluated.")
+        raise RuntimeError(
+            f"No valid in-bounds agent guesses were evaluated for k_true={k_true}."
+        )
+
+    k_abs_error = abs(best_so_far["k_guess"] - k_true)
+    result = {
+        "k_true": k_true,
+        "k_est": best_so_far["k_guess"],
+        "k_abs_error": k_abs_error,
+        "k_rel_error": k_abs_error / k_true,
+        "best_u_error": best_so_far["u_error"],
+        "n_iterations": len(history),
+        "converged": best_so_far["u_error"] <= TARGET_U_ERROR,
+        "iters_to_converge": iters_to_converge,
+        "k_true_in_bounds": K_MIN <= k_true <= K_MAX,
+        "history": history,
+        "config": cfg,
+        "x": x,
+        "target_u": target_u,
+        "u0": u0,
+    }
+    return result
+
+
+def run_single_report(agent_client, k_true, max_iterations=MAX_ITERATIONS):
+    """Run one k_true and emit the detailed single-run table, CSV and figure."""
+    result = run_single(agent_client, k_true, max_iterations=max_iterations)
+    cfg = result["config"]
 
     _, best_u = solve_heat(
-        best_so_far["k_guess"],
-        u0,
-        config["T"],
-        config["Nx"],
-        config["dt"],
-        l=config["L"],
+        result["k_est"], result["u0"], cfg["T"], cfg["Nx"], cfg["dt"], l=cfg["L"]
     )
 
-    k_true = config["k_true"]
-
-    print_history_table(history, k_true)
-    csv_path = write_history_csv(history, k_true, HISTORY_CSV_PATH)
+    print_history_table(result["history"], k_true)
+    csv_path = write_history_csv(result["history"], k_true, HISTORY_CSV_PATH)
 
     print("\nFinal report")
-    print(f"estimated k: {best_so_far['k_guess']:.8f}")
+    print(f"estimated k: {result['k_est']:.8f}")
     print(f"true k:      {k_true:.8f}")
-    print(f"abs error:   {abs(best_so_far['k_guess'] - k_true):.4e}")
-    print(f"best loss:   {best_so_far['u_error']:.4e}")
-    print(f"iterations:  {len(history)} valid evaluations")
+    print(f"abs error:   {result['k_abs_error']:.4e}")
+    print(f"rel error:   {result['k_rel_error']:.4e}")
+    print(f"best loss:   {result['best_u_error']:.4e}")
+    print(f"iterations:  {result['n_iterations']} valid evaluations")
+    print(f"converged:   {result['converged']}")
     print(f"history csv: {csv_path}")
 
-    plot_results(x, target_u, best_u, history, k_true, PLOT_PATH)
-    return best_so_far
+    plot_results(
+        result["x"], result["target_u"], best_u, result["history"], k_true, PLOT_PATH
+    )
+    return result
+
+
+def run_sweep(agent_client, k_values, max_iterations=MAX_ITERATIONS, show=True):
+    """Run the agent against many true k values and produce aggregate artifacts."""
+    print(f"provider: {agent_client.provider}")
+    print(f"model:    {agent_client.model}")
+    print(f"sweep over {len(k_values)} k_true values\n")
+
+    results = []
+    failures = []
+    for k_true in k_values:
+        try:
+            result = run_single(
+                agent_client, k_true, max_iterations=max_iterations, verbose=False
+            )
+        except Exception as exc:  # keep partial sweeps: one bad k must not wipe all
+            failures.append((k_true, exc))
+            print(f"  k_true={k_true:>10.4g}  FAILED: {type(exc).__name__}: {exc}")
+            continue
+        results.append(result)
+        conv = "yes" if result["converged"] else "NO "
+        print(
+            f"  k_true={k_true:>10.4g}  k_est={result['k_est']:>10.4g}  "
+            f"rel_err={result['k_rel_error']:>9.2e}  "
+            f"u_err={result['best_u_error']:>9.2e}  "
+            f"iters={result['n_iterations']:>2}  converged={conv}"
+        )
+
+    if failures:
+        print(f"\n{len(failures)} of {len(k_values)} runs failed and were skipped:")
+        for k_true, exc in failures:
+            print(f"  k_true={k_true:.4g}: {type(exc).__name__}: {exc}")
+    if not results:
+        raise RuntimeError("Every sweep run failed; no artifacts to write.")
+
+    print_sweep_table(results)
+    csv_path = write_sweep_csv(results, SWEEP_CSV_PATH)
+    print(f"\nsweep csv: {csv_path}")
+
+    plot_sweep_performance(results, SWEEP_PLOT_PATH, show=show)
+    plot_sweep_trajectories(results, SWEEP_TRAJECTORY_PATH, show=show)
+
+    hardest = max(results, key=lambda r: r["k_rel_error"])
+    print(
+        f"\nHardest k_true to identify: {hardest['k_true']:.4g} "
+        f"(relative k error {hardest['k_rel_error']:.2e})"
+    )
+    return results
 
 
 def print_history_table(history, k_true):
@@ -313,6 +488,47 @@ def write_history_csv(history, k_true, path):
                     "rationale": item["rationale"],
                 }
             )
+    return path
+
+
+def print_sweep_table(results):
+    """Print the across-k summary table of agent performance."""
+    print("\nSweep summary (agent performance vs true k)")
+    header = (
+        f"{'k_true':>12}  {'k_est':>12}  {'k_abs_error':>12}  "
+        f"{'k_rel_error':>12}  {'best_u_error':>13}  {'iters':>6}  "
+        f"{'to_conv':>7}  {'converged':>9}  {'in_bnds':>7}"
+    )
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        to_conv = r["iters_to_converge"] if r["iters_to_converge"] is not None else "-"
+        print(
+            f"{r['k_true']:>12.6g}  {r['k_est']:>12.6g}  {r['k_abs_error']:>12.4e}  "
+            f"{r['k_rel_error']:>12.4e}  {r['best_u_error']:>13.4e}  "
+            f"{r['n_iterations']:>6}  {str(to_conv):>7}  {str(r['converged']):>9}  "
+            f"{str(r['k_true_in_bounds']):>7}"
+        )
+
+
+def write_sweep_csv(results, path):
+    """Write the across-k summary to CSV and return its path."""
+    fields = [
+        "k_true",
+        "k_est",
+        "k_abs_error",
+        "k_rel_error",
+        "best_u_error",
+        "n_iterations",
+        "iters_to_converge",
+        "converged",
+        "k_true_in_bounds",
+    ]
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for r in results:
+            writer.writerow({field: r[field] for field in fields})
     return path
 
 
@@ -363,18 +579,197 @@ def plot_results(x, target_u, best_u, history, k_true, save_path=None):
     if save_path:
         fig.savefig(save_path, dpi=150)
         print(f"plot saved: {save_path}")
-    plt.show()
+    if save_path is None:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
-def main():
+def plot_sweep_performance(results, save_path=None, show=True):
+    """Per-run convergence trajectories (3 panels) plus the effort bar chart.
+
+    The three trajectory panels each put the iteration number on the x axis and,
+    on the y axis, the guessed k, the relative k error, and the absolute k error.
+    Every run is one line, colored by its true k (dark = small, bright = large).
+    """
+    from matplotlib.colors import LogNorm
+
+    k_true = np.array([r["k_true"] for r in results])
+    iters_used = np.array([r["n_iterations"] for r in results])
+    converged = np.array([r["converged"] for r in results])
+
+    cmap = plt.get_cmap("viridis")
+    norm = LogNorm(vmin=k_true.min(), vmax=k_true.max())
+
+    def color_for(k):
+        return cmap(norm(k))
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+    # Guessed k per iteration, with the allowed guess band drawn in.
+    ax = axes[0, 0]
+    for r in results:
+        history = r["history"]
+        if not history:
+            continue
+        xs = [item["iteration"] for item in history]
+        ys = [item["k_guess"] for item in history]
+        ax.plot(xs, ys, marker="o", ms=3, color=color_for(r["k_true"]))
+    ax.axhline(K_MIN, color="k", linestyle="--", lw=1, alpha=0.6)
+    ax.axhline(K_MAX, color="k", linestyle="--", lw=1, alpha=0.6, label="guess bounds")
+    ax.set_yscale("log")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("guessed k")
+    ax.set_title("Guessed k per iteration")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, which="both", alpha=0.3)
+
+    # Relative k error per iteration.
+    ax = axes[0, 1]
+    for r in results:
+        history = r["history"]
+        if not history:
+            continue
+        xs = [item["iteration"] for item in history]
+        ys = [abs(item["k_guess"] - r["k_true"]) / r["k_true"] for item in history]
+        ax.semilogy(xs, ys, marker="o", ms=3, color=color_for(r["k_true"]))
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("relative k error")
+    ax.set_title("Relative k error per iteration")
+    ax.grid(True, which="both", alpha=0.3)
+
+    # Absolute k error per iteration.
+    ax = axes[1, 0]
+    for r in results:
+        history = r["history"]
+        if not history:
+            continue
+        xs = [item["iteration"] for item in history]
+        ys = [abs(item["k_guess"] - r["k_true"]) for item in history]
+        ax.semilogy(xs, ys, marker="o", ms=3, color=color_for(r["k_true"]))
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("absolute k error")
+    ax.set_title("Absolute k error per iteration")
+    ax.grid(True, which="both", alpha=0.3)
+
+    # Iterations used vs true k, colored by convergence (kept from before).
+    colors = ["C2" if c else "C3" for c in converged]
+    axes[1, 1].bar(range(len(k_true)), iters_used, color=colors)
+    axes[1, 1].axhline(MAX_ITERATIONS, color="k", linestyle=":", label="iteration cap")
+    axes[1, 1].set_xticks(range(len(k_true)))
+    axes[1, 1].set_xticklabels([f"{k:.3g}" for k in k_true], rotation=45, ha="right")
+    axes[1, 1].set_xlabel("k_true")
+    axes[1, 1].set_ylabel("iterations used")
+    axes[1, 1].set_title("Effort vs true k (green=converged)")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, axis="y", alpha=0.3)
+
+    # Shared colorbar for the three trajectory panels.
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    fig.colorbar(
+        sm,
+        ax=[axes[0, 0], axes[0, 1], axes[1, 0]],
+        label="k_true",
+        fraction=0.05,
+        pad=0.02,
+    )
+
+    fig.suptitle("Agent convergence across the k sweep", fontsize=14)
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        print(f"plot saved: {save_path}")
+    if show and save_path is None:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_sweep_trajectories(results, save_path=None, show=True):
+    """Overlay each run's relative k-error trajectory, colored by true k."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    cmap = plt.get_cmap("viridis")
+    log_k = np.log10([r["k_true"] for r in results])
+    lo, hi = log_k.min(), log_k.max()
+
+    for r in results:
+        history = r["history"]
+        if not history:
+            continue
+        iters = [item["iteration"] for item in history]
+        rel = [abs(item["k_guess"] - r["k_true"]) / r["k_true"] for item in history]
+        frac = 0.0 if hi == lo else (math.log10(r["k_true"]) - lo) / (hi - lo)
+        ax.semilogy(
+            iters, rel, marker="o", color=cmap(frac), label=f"k={r['k_true']:.3g}"
+        )
+
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("relative k error")
+    ax.set_title("Convergence trajectory per true k")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=8, ncol=2, loc="upper right")
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        print(f"plot saved: {save_path}")
+    if show and save_path is None:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Agentic estimation of 1D heat-equation diffusivity k."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["sweep", "single"],
+        default="sweep",
+        help="Sweep many true k values (default) or run a single detailed estimate.",
+    )
+    parser.add_argument(
+        "--k-true",
+        type=float,
+        default=0.12,
+        help="True k for --mode single (default 0.12).",
+    )
+    parser.add_argument(
+        "--values",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Override the list of true k values to sweep.",
+    )
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=MAX_ITERATIONS,
+        help=f"Max agent iterations per run (default {MAX_ITERATIONS}).",
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Use the offline log-bisection agent instead of an LLM.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     status = env_status()
     print(
         "environment: "
         f"OPENROUTER_API_KEY={status['OPENROUTER_API_KEY']}, "
         f"GEMINI_API_KEY={status['GEMINI_API_KEY']}"
     )
-    agent_client = create_agent_client()
-    run_agent_loop(agent_client)
+    agent_client = create_agent_client(mock=args.mock)
+
+    if args.mode == "single":
+        run_single_report(agent_client, args.k_true, max_iterations=args.max_iters)
+    else:
+        k_values = args.values if args.values else SWEEP_K_VALUES
+        run_sweep(agent_client, k_values, max_iterations=args.max_iters)
 
 
 if __name__ == "__main__":

@@ -7,10 +7,22 @@ local numerical solver evaluates each proposal.
 ## What It Does
 
 - Solves `u_t = k u_xx` on `[0, 1]` with zero Dirichlet boundaries.
-- Generates target data with `k_true = 0.12`.
 - Uses an agent loop to propose `k` guesses within `[1e-4, 1.0]`.
 - Evaluates each guess with relative field error and signed width error.
-- Supports OpenRouter first, with Google Gemini as a fallback.
+- **Sweeps many true `k` values** (very small `1e-4` to very big `1.0`) and
+  measures where the agent struggles to recover the true `k`.
+- Supports OpenRouter first, with Google Gemini as a fallback, plus an offline
+  `--mock` bracketing agent so the pipeline runs without an API key.
+
+## Why Some k Are Hard
+
+Over the fixed observation time `T`, the field is only weakly sensitive to `k`
+at the extremes: very small `k` barely diffuses, and very large `k` has already
+diffused almost completely. In those regimes many different `k` values produce
+nearly the same field, so the field misfit (`u_error`) can drop below the
+stopping target while the recovered `k` is still far off. The sweep makes this
+identifiability gap visible: relative `k` error is large at small `k` even for a
+perfect bracketing search, and larger still for the LLM.
 
 ## Setup
 
@@ -40,16 +52,44 @@ export GEMINI_MODEL="gemini-3.5-flash"
 
 ## Run
 
+Sweep across many true `k` values (default mode):
+
 ```bash
-.venv/bin/python agentic_k_demo.py
+.venv/bin/python agentic_k_demo.py                 # LLM agent
+.venv/bin/python agentic_k_demo.py --mock          # offline, no API key
+.venv/bin/python agentic_k_demo.py --values 1e-4 1e-3 0.12 0.5 1.0
 ```
 
-The script prints a per-iteration table (`k` guess, `k` absolute error, field
-error, signed width error, confidence) and a final estimate. It writes the full
-history to `k_history.csv`, saves a 4-panel figure to `k_convergence.png`, and
-opens a Matplotlib window. The figure shows the target vs. best profile, `k`
-guesses per iteration against `k_true`, field/`k` errors per iteration on a log
-scale, and the signed width error per iteration.
+The default sweep also includes true `k` values **outside** the `[1e-4, 1.0]`
+range the agent may guess in (`1e-5`, `2.0`, `5.0`), so the agent cannot reach
+the true value and can only rail against the nearest bound.
+
+The sweep prints a per-`k` summary table and writes:
+
+- `k_sweep_results.csv` - one row per true `k` (estimate, absolute/relative `k`
+  error, best field error, iterations, convergence flag, in-bounds flag).
+- `k_sweep_performance.png` - 4 panels. Three plot per-run convergence with the
+  iteration on the x axis: guessed `k`, relative `k` error, and absolute `k`
+  error, one line per run colored by true `k` (dark = small, bright = large).
+  The guessed-`k` panel draws the allowed guess band so out-of-range runs are
+  visible as lines pinned to a bound. The fourth panel keeps iterations used per
+  `k` (green = converged).
+- `k_sweep_trajectories.png` - each run's relative `k`-error trajectory in a
+  single larger panel, colored from small (dark) to large (bright) true `k`.
+
+Single detailed run against one `k`:
+
+```bash
+.venv/bin/python agentic_k_demo.py --mode single --k-true 0.12
+```
+
+This prints a per-iteration table (`k` guess, `k` absolute error, field error,
+signed width error, confidence) and a final estimate, writes the full history to
+`k_history.csv`, and saves a 4-panel figure to `k_convergence.png` (target vs.
+best profile, `k` guesses per iteration against `k_true`, field/`k` errors per
+iteration on a log scale, and the signed width error per iteration).
+
+Other flags: `--max-iters N` caps agent iterations per run.
 
 ## Test
 
