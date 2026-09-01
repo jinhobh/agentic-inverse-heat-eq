@@ -1,3 +1,13 @@
+"""Agentic estimation of 2-D diffusion-equation diffusivity k.
+
+Mirrors ``agentic_k_demo.py`` but for the 2-D equation
+
+    u_t = k * (u_xx + u_yy)
+
+on [0, Lx] x [0, Ly] with zero Dirichlet boundaries and a Gaussian initial
+condition.
+"""
+
 import argparse
 import csv
 import json
@@ -5,31 +15,41 @@ import math
 import os
 from typing import Literal
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import matplotlib.pyplot as plt
 import numpy as np
 from pydantic import BaseModel, Field, ValidationError
 
-from heateq_num_solver import gaussian_ic, heat_errors, solve_heat
+from diffeq2d_num_solver import (
+    diffusion_errors_2d,
+    gaussian_ic_2d,
+    profile_width_2d,
+    solve_diffusion_2d,
+)
 
 
+# ---------------------------------------------------------------------------
+#  Global constants (tuneable)
+# ---------------------------------------------------------------------------
 K_MIN = 1e-4
 K_MAX = 1.0
 MAX_ITERATIONS = 20
 TARGET_U_ERROR = 1e-3
-HISTORY_CSV_PATH = "k_history.csv"
-PLOT_PATH = "k_convergence.png"
-SWEEP_CSV_PATH = "k_sweep_results.csv"
-SWEEP_PLOT_PATH = "k_sweep_performance.png"
-SWEEP_TRAJECTORY_PATH = "k_sweep_trajectories.png"
+
+HISTORY_CSV_PATH = "k_history_2d.csv"
+PLOT_PATH = "k_convergence_2d.png"
+SWEEP_CSV_PATH = "k_sweep_results_2d.csv"
+SWEEP_PLOT_PATH = "k_sweep_performance_2d.png"
+SWEEP_TRAJECTORY_PATH = "k_sweep_trajectories_2d.png"
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = "google/gemini-2.5-flash"
+OPENROUTER_MODEL = "deepseek/deepseek-v4-pro"
 GEMINI_MODEL = "gemini-3.5-flash"
 
-# Default k_true values to sweep, from very small to very big, log-spaced. Small
-# and large k are physically hard to identify because the field is insensitive to
-# k there (little diffusion, or fully diffused). The first and last two values
-# (1e-5, 2.0, 5.0) sit OUTSIDE the [K_MIN, K_MAX] range the agent may guess in, so
-# the agent cannot reach the true k and can only rail against the nearest bound.
+# Default k_true values, log-spaced (same set as the 1-D demo for fair
+# comparison).  The first and last two sit OUTSIDE [K_MIN, K_MAX].
 SWEEP_K_VALUES = [
     1e-5,
     1e-4,
@@ -48,9 +68,12 @@ SWEEP_K_VALUES = [
     5.0,
 ]
 
-BASE_CONFIG = {"L": 1.0, "Nx": 101, "T": 0.02, "dt": 1e-4}
+BASE_CONFIG = {"Lx": 1.0, "Ly": 1.0, "Nx": 51, "Ny": 51, "T": 0.02, "dt": 1e-4}
 
 
+# ---------------------------------------------------------------------------
+#  Agent decision model (identical to 1-D)
+# ---------------------------------------------------------------------------
 class AgentDecision(BaseModel):
     action: Literal["evaluate", "stop"]
     k_guess: float | None = None
@@ -99,6 +122,9 @@ def valid_k_guess(decision):
     return math.isfinite(decision.k_guess)
 
 
+# ---------------------------------------------------------------------------
+#  Prompt builder
+# ---------------------------------------------------------------------------
 def build_prompt(history, best_so_far):
     compact_history = [
         {
@@ -110,7 +136,7 @@ def build_prompt(history, best_so_far):
         for item in history[-8:]
     ]
     return (
-        "You are estimating the heat diffusivity k for a 1D heat equation. "
+        "You are estimating the heat diffusivity k for a 2D diffusion equation. "
         "Return only a JSON object with these fields: "
         "action ('evaluate' or 'stop'), k_guess (number or null), rationale "
         "(string), confidence (number from 0 to 1), and stop_reason "
@@ -126,6 +152,9 @@ def build_prompt(history, best_so_far):
     )
 
 
+# ---------------------------------------------------------------------------
+#  Agent client plumbing (same as 1-D)
+# ---------------------------------------------------------------------------
 class AgentClient:
     def __init__(self, provider, client, model):
         self.provider = provider
@@ -147,7 +176,7 @@ def create_agent_client(mock=False):
                 api_key=os.environ["OPENROUTER_API_KEY"],
                 default_headers={
                     "HTTP-Referer": "http://localhost",
-                    "X-Title": "Agentic Physics Heat Diffusivity Demo",
+                    "X-Title": "Agentic Physics 2D Diffusion Demo",
                 },
             ),
             model=os.environ.get("OPENROUTER_MODEL", OPENROUTER_MODEL),
@@ -169,25 +198,18 @@ def create_agent_client(mock=False):
 
 
 def agent_tag(agent_client):
-    """Short filename tag identifying which agent produced an artifact.
-
-    The mock agent is NOT an AI model (it is a deterministic bisection search),
-    so its artifacts are tagged to make that unambiguous.
-    """
     if agent_client.provider == "mock":
         return "bisection_nonai"
     return agent_client.provider
 
 
 def agent_label(agent_client):
-    """Human-readable agent identity for figure titles."""
     if agent_client.provider == "mock":
         return "bisection search (NOT an AI model)"
     return f"{agent_client.provider}:{agent_client.model}"
 
 
 def tagged_path(path, tag):
-    """Insert an agent tag before a filename's extension."""
     root, ext = os.path.splitext(path)
     return f"{root}_{tag}{ext}"
 
@@ -226,27 +248,24 @@ def call_agent(agent_client, prompt):
     )
 
 
+# ---------------------------------------------------------------------------
+#  Proposers
+# ---------------------------------------------------------------------------
 class MockProposer:
-    """Deterministic offline agent: log-domain bisection on width-error sign.
-
-    Stands in for the LLM so the loop and sweep can run without API access. It
-    also cleanly exposes the *physics* limit: at extreme k the field barely
-    responds to k, so even a perfect bracketing search leaves a large k error
-    once u_error dips below the stopping target.
-    """
+    """Deterministic offline agent: log-domain bisection on width-error sign."""
 
     def __init__(self):
         self.lo = K_MIN
         self.hi = K_MAX
 
-    def propose(self, history, best_so_far):
+    def propose(self, history, _best_so_far):
         if history:
             last = history[-1]
             k = last["k_guess"]
             width_error = last["width_error"]
-            if width_error > 0:  # guess diffused too much -> k too high
+            if width_error > 0:
                 self.hi = min(self.hi, k)
-            elif width_error < 0:  # k too low
+            elif width_error < 0:
                 self.lo = max(self.lo, k)
         guess = math.sqrt(self.lo * self.hi)
         decision = AgentDecision(
@@ -274,19 +293,27 @@ def make_proposer(agent_client):
     return LLMProposer(agent_client)
 
 
+# ---------------------------------------------------------------------------
+#  Evaluate a single guess
+# ---------------------------------------------------------------------------
 def evaluate_guess(k_guess, u0, target_u, config):
-    u_error, width_error = heat_errors(
+    u_error, width_error = diffusion_errors_2d(
         k_guess,
         u0,
         config["T"],
         config["Nx"],
+        config["Ny"],
         config["dt"],
         target_u,
-        L=config["L"],
+        Lx=config["Lx"],
+        Ly=config["Ly"],
     )
     return float(u_error), float(width_error)
 
 
+# ---------------------------------------------------------------------------
+#  Single run
+# ---------------------------------------------------------------------------
 def run_single(
     agent_client,
     k_true,
@@ -294,16 +321,17 @@ def run_single(
     max_iterations=MAX_ITERATIONS,
     verbose=True,
 ):
-    """Run the agent loop against one true diffusivity and return a result dict."""
+    """Run the agent loop against one true diffusivity (2-D)."""
     cfg = dict(BASE_CONFIG)
     if config:
         cfg.update(config)
     cfg["k_true"] = k_true
 
-    x = np.linspace(0.0, cfg["L"], cfg["Nx"])
-    u0 = gaussian_ic(x)
-    _, target_u = solve_heat(
-        k_true, u0, cfg["T"], cfg["Nx"], cfg["dt"], l=cfg["L"]
+    x = np.linspace(0.0, cfg["Lx"], cfg["Nx"])
+    y = np.linspace(0.0, cfg["Ly"], cfg["Ny"])
+    u0 = gaussian_ic_2d(x, y)
+    _, _, target_u = solve_diffusion_2d(
+        k_true, u0, cfg["T"], cfg["Nx"], cfg["Ny"], cfg["dt"], cfg["Lx"], cfg["Ly"]
     )
 
     proposer = make_proposer(agent_client)
@@ -322,13 +350,12 @@ def run_single(
         try:
             decision, parse_error = proposer.propose(history, best_so_far)
         except Exception as exc:
-            # A transient API error should not discard the guesses already made;
-            # if none were made yet, let the caller decide how to record it.
             if best_so_far is not None:
                 if verbose:
                     print(f"{iteration:>4}  api error, stopping run: {exc}")
                 break
             raise
+
         if decision is None:
             if verbose:
                 print(f"{iteration:>4}  invalid response: {parse_error}")
@@ -336,7 +363,9 @@ def run_single(
 
         if decision.action == "stop":
             if verbose:
-                print(f"{iteration:>4}  stop: {decision.stop_reason or decision.rationale}")
+                print(
+                    f"{iteration:>4}  stop: {decision.stop_reason or decision.rationale}"
+                )
             break
 
         if not valid_k_guess(decision):
@@ -360,7 +389,8 @@ def run_single(
         if verbose:
             print(
                 f"{iteration:>4}  {decision.k_guess:>12.8f}  {u_error:>11.4e}  "
-                f"{width_error:>12.4e}  {decision.confidence:>10.2f}  {decision.rationale}"
+                f"{width_error:>12.4e}  {decision.confidence:>10.2f}  "
+                f"{decision.rationale}"
             )
 
         if u_error <= TARGET_U_ERROR:
@@ -387,19 +417,29 @@ def run_single(
         "history": history,
         "config": cfg,
         "x": x,
+        "y": y,
         "target_u": target_u,
         "u0": u0,
     }
     return result
 
 
+# ---------------------------------------------------------------------------
+#  Single-run reporting
+# ---------------------------------------------------------------------------
 def run_single_report(agent_client, k_true, max_iterations=MAX_ITERATIONS):
-    """Run one k_true and emit the detailed single-run table, CSV and figure."""
     result = run_single(agent_client, k_true, max_iterations=max_iterations)
     cfg = result["config"]
 
-    _, best_u = solve_heat(
-        result["k_est"], result["u0"], cfg["T"], cfg["Nx"], cfg["dt"], l=cfg["L"]
+    _, _, best_u = solve_diffusion_2d(
+        result["k_est"],
+        result["u0"],
+        cfg["T"],
+        cfg["Nx"],
+        cfg["Ny"],
+        cfg["dt"],
+        cfg["Lx"],
+        cfg["Ly"],
     )
 
     tag = agent_tag(agent_client)
@@ -423,6 +463,7 @@ def run_single_report(agent_client, k_true, max_iterations=MAX_ITERATIONS):
 
     plot_results(
         result["x"],
+        result["y"],
         result["target_u"],
         best_u,
         result["history"],
@@ -433,63 +474,7 @@ def run_single_report(agent_client, k_true, max_iterations=MAX_ITERATIONS):
     return result
 
 
-def run_sweep(agent_client, k_values, max_iterations=MAX_ITERATIONS, show=True):
-    """Run the agent against many true k values and produce aggregate artifacts."""
-    print(f"provider: {agent_client.provider}")
-    print(f"model:    {agent_client.model}")
-    print(f"sweep over {len(k_values)} k_true values\n")
-
-    results = []
-    failures = []
-    for k_true in k_values:
-        try:
-            result = run_single(
-                agent_client, k_true, max_iterations=max_iterations, verbose=False
-            )
-        except Exception as exc:  # keep partial sweeps: one bad k must not wipe all
-            failures.append((k_true, exc))
-            print(f"  k_true={k_true:>10.4g}  FAILED: {type(exc).__name__}: {exc}")
-            continue
-        results.append(result)
-        conv = "yes" if result["converged"] else "NO "
-        print(
-            f"  k_true={k_true:>10.4g}  k_est={result['k_est']:>10.4g}  "
-            f"rel_err={result['k_rel_error']:>9.2e}  "
-            f"u_err={result['best_u_error']:>9.2e}  "
-            f"iters={result['n_iterations']:>2}  converged={conv}"
-        )
-
-    if failures:
-        print(f"\n{len(failures)} of {len(k_values)} runs failed and were skipped:")
-        for k_true, exc in failures:
-            print(f"  k_true={k_true:.4g}: {type(exc).__name__}: {exc}")
-    if not results:
-        raise RuntimeError("Every sweep run failed; no artifacts to write.")
-
-    tag = agent_tag(agent_client)
-    label = agent_label(agent_client)
-
-    print_sweep_table(results)
-    csv_path = write_sweep_csv(results, tagged_path(SWEEP_CSV_PATH, tag))
-    print(f"\nsweep csv: {csv_path}")
-
-    plot_sweep_performance(
-        results, tagged_path(SWEEP_PLOT_PATH, tag), show=show, agent_label=label
-    )
-    plot_sweep_trajectories(
-        results, tagged_path(SWEEP_TRAJECTORY_PATH, tag), show=show, agent_label=label
-    )
-
-    hardest = max(results, key=lambda r: r["k_rel_error"])
-    print(
-        f"\nHardest k_true to identify: {hardest['k_true']:.4g} "
-        f"(relative k error {hardest['k_rel_error']:.2e})"
-    )
-    return results
-
-
 def print_history_table(history, k_true):
-    """Print a per-iteration table of k guesses and errors."""
     print("\nPer-iteration guesses")
     header = (
         f"{'iter':>4}  {'k_guess':>12}  {'k_abs_error':>12}  "
@@ -506,7 +491,6 @@ def print_history_table(history, k_true):
 
 
 def write_history_csv(history, k_true, path):
-    """Write the per-iteration history to a CSV file and return its path."""
     fields = [
         "iteration",
         "k_guess",
@@ -534,8 +518,66 @@ def write_history_csv(history, k_true, path):
     return path
 
 
+# ---------------------------------------------------------------------------
+#  Sweep
+# ---------------------------------------------------------------------------
+def run_sweep(agent_client, k_values, max_iterations=MAX_ITERATIONS, show=True):
+    print(f"provider: {agent_client.provider}")
+    print(f"model:    {agent_client.model}")
+    print(f"sweep over {len(k_values)} k_true values\n")
+
+    results = []
+    failures = []
+    for k_true in k_values:
+        try:
+            result = run_single(
+                agent_client, k_true, max_iterations=max_iterations, verbose=False
+            )
+        except Exception as exc:
+            failures.append((k_true, exc))
+            print(f"  k_true={k_true:>10.4g}  FAILED: {type(exc).__name__}: {exc}")
+            continue
+        results.append(result)
+        conv = "yes" if result["converged"] else "NO "
+        print(
+            f"  k_true={k_true:>10.4g}  k_est={result['k_est']:>10.4g}  "
+            f"rel_err={result['k_rel_error']:>9.2e}  "
+            f"u_err={result['best_u_error']:>9.2e}  "
+            f"iters={result['n_iterations']:>2}  converged={conv}"
+        )
+
+    if failures:
+        print(
+            f"\n{len(failures)} of {len(k_values)} runs failed and were skipped:"
+        )
+        for k_true, exc in failures:
+            print(f"  k_true={k_true:.4g}: {type(exc).__name__}: {exc}")
+    if not results:
+        raise RuntimeError("Every sweep run failed; no artifacts to write.")
+
+    tag = agent_tag(agent_client)
+    label = agent_label(agent_client)
+
+    print_sweep_table(results)
+    csv_path = write_sweep_csv(results, tagged_path(SWEEP_CSV_PATH, tag))
+    print(f"\nsweep csv: {csv_path}")
+
+    plot_sweep_performance(
+        results, tagged_path(SWEEP_PLOT_PATH, tag), show=show, agent_label=label
+    )
+    plot_sweep_trajectories(
+        results, tagged_path(SWEEP_TRAJECTORY_PATH, tag), show=show, agent_label=label
+    )
+
+    hardest = max(results, key=lambda r: r["k_rel_error"])
+    print(
+        f"\nHardest k_true to identify: {hardest['k_true']:.4g} "
+        f"(relative k error {hardest['k_rel_error']:.2e})"
+    )
+    return results
+
+
 def print_sweep_table(results):
-    """Print the across-k summary table of agent performance."""
     print("\nSweep summary (agent performance vs true k)")
     header = (
         f"{'k_true':>12}  {'k_est':>12}  {'k_abs_error':>12}  "
@@ -545,17 +587,19 @@ def print_sweep_table(results):
     print(header)
     print("-" * len(header))
     for r in results:
-        to_conv = r["iters_to_converge"] if r["iters_to_converge"] is not None else "-"
+        to_conv = (
+            r["iters_to_converge"] if r["iters_to_converge"] is not None else "-"
+        )
         print(
-            f"{r['k_true']:>12.6g}  {r['k_est']:>12.6g}  {r['k_abs_error']:>12.4e}  "
+            f"{r['k_true']:>12.6g}  {r['k_est']:>12.6g}  "
+            f"{r['k_abs_error']:>12.4e}  "
             f"{r['k_rel_error']:>12.4e}  {r['best_u_error']:>13.4e}  "
-            f"{r['n_iterations']:>6}  {str(to_conv):>7}  {str(r['converged']):>9}  "
-            f"{str(r['k_true_in_bounds']):>7}"
+            f"{r['n_iterations']:>6}  {str(to_conv):>7}  "
+            f"{str(r['converged']):>9}  {str(r['k_true_in_bounds']):>7}"
         )
 
 
 def write_sweep_csv(results, path):
-    """Write the across-k summary to CSV and return its path."""
     fields = [
         "k_true",
         "k_est",
@@ -575,34 +619,45 @@ def write_sweep_csv(results, path):
     return path
 
 
-def plot_results(x, target_u, best_u, history, k_true, save_path=None, agent_label=None):
+# ---------------------------------------------------------------------------
+#  Plotting
+# ---------------------------------------------------------------------------
+def plot_results(
+    x, y, target_u, best_u, history, k_true, save_path=None, agent_label=None
+):
+    """Single-run 2-D convergence figure.
+
+    Four panels: target field, best-guess field, field difference, and
+    per-iteration convergence metrics (k guesses, errors, width error).
+    """
     iterations = [item["iteration"] for item in history]
     k_guesses = [item["k_guess"] for item in history]
     u_errors = [item["u_error"] for item in history]
     k_errors = [abs(item["k_guess"] - k_true) for item in history]
     width_errors = [item["width_error"] for item in history]
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    X, Y = np.meshgrid(x, y, indexing="ij")
 
-    # Target vs best estimated profile.
-    axes[0, 0].plot(x, target_u, label="target")
-    axes[0, 0].plot(x, best_u, "--", label="best estimate")
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+    # Target field (heatmap).
+    im0 = axes[0, 0].pcolormesh(X, Y, target_u, shading="auto", cmap="viridis")
+    axes[0, 0].set_title("Target field")
     axes[0, 0].set_xlabel("x")
-    axes[0, 0].set_ylabel("u")
-    axes[0, 0].set_title("Field profile")
-    axes[0, 0].legend()
+    axes[0, 0].set_ylabel("y")
+    plt.colorbar(im0, ax=axes[0, 0])
 
-    # k guess per iteration with true-k reference line.
-    axes[0, 1].plot(iterations, k_guesses, marker="o", label="k_guess")
-    axes[0, 1].axhline(k_true, color="k", linestyle=":", label="k_true")
-    axes[0, 1].set_xlabel("iteration")
-    axes[0, 1].set_ylabel("k")
-    axes[0, 1].set_title("k guess per iteration")
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
+    # Best-guess field (heatmap).
+    im1 = axes[0, 1].pcolormesh(X, Y, best_u, shading="auto", cmap="viridis")
+    axes[0, 1].set_title("Best-guess field")
+    axes[0, 1].set_xlabel("x")
+    axes[0, 1].set_ylabel("y")
+    plt.colorbar(im1, ax=axes[0, 1])
 
     # Field and k errors per iteration (log scale).
-    axes[1, 0].semilogy(iterations, u_errors, marker="o", label="relative field error")
+    axes[1, 0].semilogy(
+        iterations, u_errors, marker="o", label="relative field error"
+    )
     axes[1, 0].semilogy(iterations, k_errors, marker="s", label="k abs error")
     axes[1, 0].set_xlabel("iteration")
     axes[1, 0].set_ylabel("error")
@@ -610,15 +665,28 @@ def plot_results(x, target_u, best_u, history, k_true, save_path=None, agent_lab
     axes[1, 0].legend()
     axes[1, 0].grid(True, which="both", alpha=0.3)
 
-    # Signed width error per iteration.
-    axes[1, 1].plot(iterations, width_errors, marker="o", color="C3")
-    axes[1, 1].axhline(0.0, color="k", linestyle=":")
-    axes[1, 1].set_xlabel("iteration")
-    axes[1, 1].set_ylabel("width_error (guess - target)")
-    axes[1, 1].set_title("Signed width error per iteration")
-    axes[1, 1].grid(True, alpha=0.3)
+    # Signed width error and k guesses per iteration.
+    ax_r = axes[1, 1]
+    ax_r.plot(iterations, width_errors, marker="o", color="C3", label="width error")
+    ax_r.axhline(0.0, color="k", linestyle=":")
+    ax_r.set_xlabel("iteration")
+    ax_r.set_ylabel("width_error (guess - target)", color="C3")
+    ax_r.tick_params(axis="y", labelcolor="C3")
+    ax_r.grid(True, alpha=0.3)
 
-    title = "Single-run convergence"
+    ax_l = ax_r.twinx()
+    ax_l.plot(
+        iterations, k_guesses, marker="s", color="C0", alpha=0.5, label="k_guess"
+    )
+    ax_l.axhline(k_true, color="k", linestyle=":")
+    ax_l.set_ylabel("k", color="C0")
+    ax_l.tick_params(axis="y", labelcolor="C0")
+
+    lines_r, labels_r = ax_r.get_legend_handles_labels()
+    lines_l, labels_l = ax_l.get_legend_handles_labels()
+    ax_r.legend(lines_r + lines_l, labels_r + labels_l, loc="best", fontsize=8)
+
+    title = "Single-run convergence (2-D)"
     if agent_label:
         title += f" (agent: {agent_label})"
     fig.suptitle(title, fontsize=13)
@@ -632,13 +700,10 @@ def plot_results(x, target_u, best_u, history, k_true, save_path=None, agent_lab
         plt.close(fig)
 
 
-def plot_sweep_performance(results, save_path=None, show=True, agent_label=None):
-    """Per-run convergence trajectories (3 panels) plus the effort bar chart.
-
-    The three trajectory panels each put the iteration number on the x axis and,
-    on the y axis, the guessed k, the relative k error, and the absolute k error.
-    Every run is one line, colored by its true k (dark = small, bright = large).
-    """
+def plot_sweep_performance(
+    results, save_path=None, show=True, agent_label=None
+):
+    """Per-run convergence trajectories + effort bar chart (2-D)."""
     from matplotlib.colors import LogNorm
 
     k_true = np.array([r["k_true"] for r in results])
@@ -653,7 +718,7 @@ def plot_sweep_performance(results, save_path=None, show=True, agent_label=None)
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
 
-    # Guessed k per iteration, with the allowed guess band drawn in.
+    # Guessed k per iteration.
     ax = axes[0, 0]
     for r in results:
         history = r["history"]
@@ -663,7 +728,7 @@ def plot_sweep_performance(results, save_path=None, show=True, agent_label=None)
         ys = [item["k_guess"] for item in history]
         ax.plot(xs, ys, marker="o", ms=3, color=color_for(r["k_true"]))
     ax.axhline(K_MIN, color="k", linestyle="--", lw=1, alpha=0.6)
-    ax.axhline(K_MAX, color="k", linestyle="--", lw=1, alpha=0.6, label="guess bounds")
+    ax.axhline(K_MAX, color="k", linestyle="--", lw=1, alpha=0.6, label="bounds")
     ax.set_yscale("log")
     ax.set_xlabel("iteration")
     ax.set_ylabel("guessed k")
@@ -678,7 +743,10 @@ def plot_sweep_performance(results, save_path=None, show=True, agent_label=None)
         if not history:
             continue
         xs = [item["iteration"] for item in history]
-        ys = [abs(item["k_guess"] - r["k_true"]) / r["k_true"] for item in history]
+        ys = [
+            abs(item["k_guess"] - r["k_true"]) / r["k_true"]
+            for item in history
+        ]
         ax.semilogy(xs, ys, marker="o", ms=3, color=color_for(r["k_true"]))
     ax.set_xlabel("iteration")
     ax.set_ylabel("relative k error")
@@ -699,19 +767,23 @@ def plot_sweep_performance(results, save_path=None, show=True, agent_label=None)
     ax.set_title("Absolute k error per iteration")
     ax.grid(True, which="both", alpha=0.3)
 
-    # Iterations used vs true k, colored by convergence (kept from before).
+    # Iterations used vs true k.
     colors = ["C2" if c else "C3" for c in converged]
     axes[1, 1].bar(range(len(k_true)), iters_used, color=colors)
-    axes[1, 1].axhline(MAX_ITERATIONS, color="k", linestyle=":", label="iteration cap")
+    axes[1, 1].axhline(
+        MAX_ITERATIONS, color="k", linestyle=":", label="iteration cap"
+    )
     axes[1, 1].set_xticks(range(len(k_true)))
-    axes[1, 1].set_xticklabels([f"{k:.3g}" for k in k_true], rotation=45, ha="right")
+    axes[1, 1].set_xticklabels(
+        [f"{k:.3g}" for k in k_true], rotation=45, ha="right"
+    )
     axes[1, 1].set_xlabel("k_true")
     axes[1, 1].set_ylabel("iterations used")
     axes[1, 1].set_title("Effort vs true k (green=converged)")
     axes[1, 1].legend()
     axes[1, 1].grid(True, axis="y", alpha=0.3)
 
-    # Shared colorbar for the three trajectory panels.
+    # Shared colour bar.
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     fig.colorbar(
@@ -722,7 +794,7 @@ def plot_sweep_performance(results, save_path=None, show=True, agent_label=None)
         pad=0.02,
     )
 
-    suptitle = "Agent convergence across the k sweep"
+    suptitle = "Agent convergence across the k sweep (2-D)"
     if agent_label:
         suptitle += f"  (agent: {agent_label})"
     fig.suptitle(suptitle, fontsize=14)
@@ -735,8 +807,10 @@ def plot_sweep_performance(results, save_path=None, show=True, agent_label=None)
         plt.close(fig)
 
 
-def plot_sweep_trajectories(results, save_path=None, show=True, agent_label=None):
-    """Overlay each run's relative k-error trajectory, colored by true k."""
+def plot_sweep_trajectories(
+    results, save_path=None, show=True, agent_label=None
+):
+    """Overlay each run's relative k-error trajectory, coloured by true k."""
     fig, ax = plt.subplots(figsize=(10, 6))
     cmap = plt.get_cmap("viridis")
     log_k = np.log10([r["k_true"] for r in results])
@@ -747,15 +821,22 @@ def plot_sweep_trajectories(results, save_path=None, show=True, agent_label=None
         if not history:
             continue
         iters = [item["iteration"] for item in history]
-        rel = [abs(item["k_guess"] - r["k_true"]) / r["k_true"] for item in history]
+        rel = [
+            abs(item["k_guess"] - r["k_true"]) / r["k_true"]
+            for item in history
+        ]
         frac = 0.0 if hi == lo else (math.log10(r["k_true"]) - lo) / (hi - lo)
         ax.semilogy(
-            iters, rel, marker="o", color=cmap(frac), label=f"k={r['k_true']:.3g}"
+            iters,
+            rel,
+            marker="o",
+            color=cmap(frac),
+            label=f"k={r['k_true']:.3g}",
         )
 
     ax.set_xlabel("iteration")
     ax.set_ylabel("relative k error")
-    title = "Convergence trajectory per true k"
+    title = "Convergence trajectory per true k (2-D)"
     if agent_label:
         title += f"  (agent: {agent_label})"
     ax.set_title(title)
@@ -771,9 +852,12 @@ def plot_sweep_trajectories(results, save_path=None, show=True, agent_label=None
         plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+#  CLI
+# ---------------------------------------------------------------------------
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Agentic estimation of 1D heat-equation diffusivity k."
+        description="Agentic estimation of 2-D diffusion-equation diffusivity k."
     )
     parser.add_argument(
         "--mode",

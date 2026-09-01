@@ -64,18 +64,36 @@ The default sweep also includes true `k` values **outside** the `[1e-4, 1.0]`
 range the agent may guess in (`1e-5`, `2.0`, `5.0`), so the agent cannot reach
 the true value and can only rail against the nearest bound.
 
-The sweep prints a per-`k` summary table and writes:
+The sweep prints a per-`k` summary table and writes artifacts **tagged with the
+agent that produced them**, so LLM output is never confused with the offline
+baseline. LLM runs write `*_openrouter.*` (or `*_gemini.*`); the `--mock` agent
+writes `*_bisection_nonai.*` because it is a deterministic bisection search, not
+an AI model. For the mock agent the files are:
 
-- `k_sweep_results.csv` - one row per true `k` (estimate, absolute/relative `k`
-  error, best field error, iterations, convergence flag, in-bounds flag).
-- `k_sweep_performance.png` - 4 panels. Three plot per-run convergence with the
-  iteration on the x axis: guessed `k`, relative `k` error, and absolute `k`
-  error, one line per run colored by true `k` (dark = small, bright = large).
-  The guessed-`k` panel draws the allowed guess band so out-of-range runs are
-  visible as lines pinned to a bound. The fourth panel keeps iterations used per
-  `k` (green = converged).
-- `k_sweep_trajectories.png` - each run's relative `k`-error trajectory in a
-  single larger panel, colored from small (dark) to large (bright) true `k`.
+- `k_sweep_results_bisection_nonai.csv` - one row per true `k` (estimate,
+  absolute/relative `k` error, best field error, iterations, convergence flag,
+  in-bounds flag).
+- `k_sweep_performance_bisection_nonai.png` - 4 panels. Three plot per-run
+  convergence with the iteration on the x axis: guessed `k`, relative `k` error,
+  and absolute `k` error, one line per run colored by true `k` (dark = small,
+  bright = large). The guessed-`k` panel draws the allowed guess band so
+  out-of-range runs are visible as lines pinned to a bound. The fourth panel
+  keeps iterations used per `k` (green = converged).
+- `k_sweep_trajectories_bisection_nonai.png` - each run's relative `k`-error
+  trajectory in a single larger panel.
+
+Every figure's title also names the agent (e.g. `agent: bisection search (NOT an
+AI model)` or `agent: openrouter:google/gemini-2.5-flash`).
+
+### Real LLM figures
+
+`reconstruct_openrouter_plot.py` re-renders the summary performance figure from
+the recorded results of the real OpenRouter (`google/gemini-2.5-flash`) sweeps,
+writing `k_sweep_performance_openrouter.png` (12 in-range values) and
+`k_sweep_performance_openrouter_oor.png` (13/15 values; `2.0` and `5.0` were
+aborted when OpenRouter ran out of credits). Only summary metrics were captured
+for those runs, so the per-iteration trajectory figure cannot be rebuilt for the
+LLM; re-run `agentic_k_demo.py` with a funded key to regenerate it live.
 
 Single detailed run against one `k`:
 
