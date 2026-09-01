@@ -3,3 +3,5 @@ matplotlib
 pydantic
 google-genai
 openai
+python-dotenv
+scipy
